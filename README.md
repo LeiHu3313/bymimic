@@ -122,6 +122,28 @@ python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_pa
 The WandB run path can be located in the run overview. It follows the format {your_organization}/{project_name}/ along
 with a unique 8-character identifier. Note that run_name is different from run_path.
 
+### Fourier GR3Mini V2.1.1 (23 DoF)
+
+The GR3Mini training model uses fixed head yaw/pitch connections and exposes 23 policy actions. Convert the 40 LAFAN1
+motions shared with the G1 set from UFO's `robot_state_npz_23dof` directory with:
+
+```bash
+python scripts/utils/convert_gr3mini_lafan.py \
+  --input-dir /path/to/robot_state_npz_23dof \
+  --output-dir data/gr3mini/lafan_g1_40
+```
+
+The converter performs URDF forward kinematics and writes the full joint/body pose and velocity schema expected by the
+tracker. Train one specialist policy directly from a converted local motion with:
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task Tracking-Flat-GR3Mini-V211-v0 \
+  --motion_file data/gr3mini/lafan_g1_40/dance1_subject1.npz \
+  --headless --logger wandb --log_project_name gr3mini_tracking \
+  --run_name dance1_subject1
+```
+
 ## Code Structure
 
 Below is an overview of the code structure for this repository:

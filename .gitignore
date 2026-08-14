@@ -42,3 +42,10 @@ _build
 
 **/assets/
 artifacts/
+
+# Keep the GR3Mini V2.1.1 robot description in this repository. Other large
+# downloaded asset directories remain ignored.
+!source/whole_body_tracking/whole_body_tracking/assets/
+!source/whole_body_tracking/whole_body_tracking/assets/fourier/
+!source/whole_body_tracking/whole_body_tracking/assets/fourier/gr3mini_v211/
+!source/whole_body_tracking/whole_body_tracking/assets/fourier/gr3mini_v211/**
