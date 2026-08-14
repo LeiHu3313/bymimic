@@ -88,6 +88,10 @@ def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
 def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filename="policy.onnx") -> None:
     onnx_path = os.path.join(path, filename)
 
+    action_scale = env.action_manager.get_term("joint_pos")._scale
+    if isinstance(action_scale, torch.Tensor):
+        action_scale = action_scale[0].cpu().tolist()
+
     observation_names = env.observation_manager.active_terms["policy"]
     observation_history_lengths: list[int] = []
 
@@ -108,7 +112,7 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         "command_names": env.command_manager.active_terms,
         "observation_names": observation_names,
         "observation_history_lengths": observation_history_lengths,
-        "action_scale": env.action_manager.get_term("joint_pos")._scale[0].cpu().tolist(),
+        "action_scale": action_scale,
         "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }

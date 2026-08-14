@@ -4,6 +4,7 @@
 
 import argparse
 import sys
+from dataclasses import MISSING
 
 from isaaclab.app import AppLauncher
 
@@ -68,6 +69,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
+    # A local motion file is required for local checkpoints because the task config
+    # intentionally leaves the motion path unset. Resolve it before creating the
+    # environment so both local and WandB checkpoint paths honor --motion_file.
+    if args_cli.motion_file is not None:
+        motion_file = os.path.abspath(args_cli.motion_file)
+        if not os.path.isfile(motion_file):
+            raise FileNotFoundError(f"Motion file does not exist: {motion_file}")
+        env_cfg.commands.motion.motion_file = motion_file
+        print(f"[INFO] Using local motion file: {motion_file}")
+
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -95,20 +106,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         resume_path = f"./logs/rsl_rl/temp/{file}"
 
-        if args_cli.motion_file is not None:
-            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
-
-        art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
-        if art is None:
-            print("[WARN] No model artifact found in the run.")
-        else:
-            env_cfg.commands.motion.motion_file = str(pathlib.Path(art.download()) / "motion.npz")
+        if args_cli.motion_file is None:
+            art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
+            if art is None:
+                print("[WARN] No model artifact found in the run.")
+            else:
+                env_cfg.commands.motion.motion_file = str(pathlib.Path(art.download()) / "motion.npz")
 
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+    if env_cfg.commands.motion.motion_file is MISSING:
+        raise ValueError("Specify --motion_file for a local checkpoint, or provide a WandB run with a motion artifact.")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -143,17 +154,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    policy_normalizer = getattr(
+        ppo_runner.alg.policy,
+        "actor_obs_normalizer",
+        getattr(ppo_runner, "obs_normalizer", None),
+    )
 
     export_motion_policy_as_onnx(
         env.unwrapped,
         ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
+        normalizer=policy_normalizer,
         path=export_model_dir,
         filename="policy.onnx",
     )
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
     # reset environment
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
