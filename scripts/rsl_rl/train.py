@@ -34,7 +34,10 @@ parser.add_argument(
     help="Interval between video recordings (in steps).",
 )
 parser.add_argument(
-    "--num_envs", type=int, default=None, help="Number of environments to simulate."
+    "--num_envs",
+    type=int,
+    default=None,
+    help="Number of environments per process; multiplied by world size with --distributed.",
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
@@ -42,6 +45,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--max_iterations", type=int, default=None, help="RL Policy training iterations."
+)
+parser.add_argument(
+    "--distributed",
+    action="store_true",
+    default=False,
+    help="Run synchronous multi-GPU training through torchrun.",
 )
 motion_group = parser.add_mutually_exclusive_group(required=True)
 motion_group.add_argument(
@@ -123,6 +132,27 @@ def main(
     env_cfg.sim.device = (
         args_cli.device if args_cli.device is not None else env_cfg.sim.device
     )
+    if (
+        args_cli.distributed
+        and args_cli.device is not None
+        and "cpu" in args_cli.device.lower()
+    ):
+        raise ValueError(
+            "Distributed training requires CUDA. Remove --device cpu or select a CUDA device."
+        )
+    if args_cli.distributed:
+        # AppLauncher resolves LOCAL_RANK from torchrun and binds Isaac Sim to
+        # this device. RSL-RL checks the same device string before initializing
+        # its NCCL process group.
+        local_rank = app_launcher.local_rank
+        env_cfg.sim.device = f"cuda:{local_rank}"
+        agent_cfg.device = f"cuda:{local_rank}"
+        agent_cfg.seed += local_rank
+        env_cfg.seed = agent_cfg.seed
+
+    is_main_process = (
+        not args_cli.distributed or getattr(app_launcher, "global_rank", 0) == 0
+    )
 
     # Load either a local motion or a WandB registry artifact.
     registry_name = args_cli.registry_name
@@ -150,7 +180,8 @@ def main(
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Logging experiment in directory: {log_root_path}")
+    if is_main_process:
+        print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if agent_cfg.run_name:
@@ -162,7 +193,7 @@ def main(
         args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None
     )
     # wrap for video recording
-    if args_cli.video:
+    if args_cli.video and not args_cli.distributed:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
             "step_trigger": lambda step: step % args_cli.video_interval == 0,
@@ -184,12 +215,13 @@ def main(
     runner = OnPolicyRunner(
         env,
         agent_cfg.to_dict(),
-        log_dir=log_dir,
+        log_dir=log_dir if is_main_process else None,
         device=agent_cfg.device,
         registry_name=registry_name,
     )
     # write git state to logs
-    runner.add_git_repo_to_log(__file__)
+    if is_main_process:
+        runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
     if agent_cfg.resume:
         # get path to previous checkpoint
@@ -200,13 +232,15 @@ def main(
         # load previously trained model
         runner.load(resume_path)
 
-    # dump the configuration into log-directory
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    with open(os.path.join(log_dir, "params", "env.pkl"), "wb") as file:
-        pickle.dump(env_cfg, file)
-    with open(os.path.join(log_dir, "params", "agent.pkl"), "wb") as file:
-        pickle.dump(agent_cfg, file)
+    # Only the main process writes run metadata. The RSL-RL runner likewise
+    # logs and checkpoints on global rank 0.
+    if is_main_process:
+        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        with open(os.path.join(log_dir, "params", "env.pkl"), "wb") as file:
+            pickle.dump(env_cfg, file)
+        with open(os.path.join(log_dir, "params", "agent.pkl"), "wb") as file:
+            pickle.dump(agent_cfg, file)
 
     # run training
     runner.learn(
