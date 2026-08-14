@@ -28,18 +28,90 @@ if TYPE_CHECKING:
 
 
 class MotionLoader:
-    def __init__(self, motion_file: str, body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_file: str,
+        body_indexes: Sequence[int] | torch.Tensor,
+        device: str = "cpu",
+        body_names: Sequence[str] | None = None,
+        joint_names: Sequence[str] | None = None,
+    ):
         assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
-        data = np.load(motion_file)
-        self.fps = data["fps"]
-        self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-        self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-        self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
-        self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
-        self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
-        self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
-        self._body_indexes = body_indexes
+        with np.load(motion_file, allow_pickle=False) as data:
+            motion_body_indexes = self._resolve_indexes(
+                data=data,
+                names_key="body_names",
+                requested_names=body_names,
+                fallback_indexes=body_indexes,
+                value_count=data["body_pos_w"].shape[1],
+                motion_file=motion_file,
+            )
+            motion_joint_indexes = self._resolve_indexes(
+                data=data,
+                names_key="joint_names",
+                requested_names=joint_names,
+                fallback_indexes=range(data["joint_pos"].shape[1]),
+                value_count=data["joint_pos"].shape[1],
+                motion_file=motion_file,
+            )
+
+            self.fps = np.array(data["fps"], copy=True)
+            self.joint_pos = torch.tensor(
+                data["joint_pos"][:, motion_joint_indexes], dtype=torch.float32, device=device
+            )
+            self.joint_vel = torch.tensor(
+                data["joint_vel"][:, motion_joint_indexes], dtype=torch.float32, device=device
+            )
+            self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
+            self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
+            self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
+            self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
+
+        self._body_indexes = torch.tensor(motion_body_indexes, dtype=torch.long, device=device)
         self.time_step_total = self.joint_pos.shape[0]
+
+    @staticmethod
+    def _resolve_indexes(
+        data: np.lib.npyio.NpzFile,
+        names_key: str,
+        requested_names: Sequence[str] | None,
+        fallback_indexes: Sequence[int] | torch.Tensor,
+        value_count: int,
+        motion_file: str,
+    ) -> list[int]:
+        """Resolve NPZ indexes by metadata names, with validated legacy fallback."""
+
+        if requested_names is not None and names_key in data.files:
+            stored_names = [
+                name.decode() if isinstance(name, bytes) else str(name) for name in data[names_key].tolist()
+            ]
+            name_to_index = {name: index for index, name in enumerate(stored_names)}
+            missing_names = [name for name in requested_names if name not in name_to_index]
+            if missing_names:
+                raise ValueError(
+                    f"Motion file '{motion_file}' is missing {names_key}: {missing_names}. "
+                    f"Available names: {stored_names}"
+                )
+            indexes = [name_to_index[name] for name in requested_names]
+        else:
+            if isinstance(fallback_indexes, torch.Tensor):
+                indexes = fallback_indexes.detach().cpu().tolist()
+            else:
+                indexes = list(fallback_indexes)
+
+        indexes = [int(index) for index in indexes]
+        invalid_indexes = [index for index in indexes if index < 0 or index >= value_count]
+        if invalid_indexes:
+            metadata_hint = (
+                f" Add a '{names_key}' array to the NPZ so indexes can be resolved by name."
+                if names_key not in data.files
+                else ""
+            )
+            raise ValueError(
+                f"Motion file '{motion_file}' has {value_count} values per frame, but "
+                f"{names_key} resolved to out-of-range indexes {invalid_indexes}.{metadata_hint}"
+            )
+        return indexes
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -71,7 +143,13 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
+        self.motion = MotionLoader(
+            self.cfg.motion_file,
+            self.body_indexes,
+            device=self.device,
+            body_names=self.cfg.body_names,
+            joint_names=self.robot.joint_names,
+        )
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
